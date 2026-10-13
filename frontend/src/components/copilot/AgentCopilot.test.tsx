@@ -481,8 +481,68 @@ describe("AgentCopilot", () => {
 
       await user.click(screen.getByRole("button", { name: "删除" }));
 
+      // 删除不可撤销：先在这一行原地确认，焦点落在取消上，误按 Enter 不会删除
+      const confirm = screen.getByRole("group", { name: "删除这条消息？" });
+      expect(withdrawQueuedMessage).not.toHaveBeenCalled();
+      expect(within(confirm).getByRole("button", { name: "取消" })).toHaveFocus();
+      await user.click(within(confirm).getByRole("button", { name: "确认删除" }));
+
       expect(withdrawQueuedMessage).toHaveBeenCalledWith("q-1", "delete");
       expect(screen.getByRole("combobox", { name: "Agent 输入" })).toHaveValue("");
+    });
+
+    it("keeps a queued message when its deletion is cancelled or dismissed with Escape", async () => {
+      const user = userEvent.setup();
+      useAssistantStore.setState({
+        currentSessionId: "session-1",
+        sessionStatus: "running",
+        queuedMessages: [{ id: "q-1", content: [{ type: "text", text: "第 3 镜改成黄昏" }], state: "queued" }],
+      });
+      render(<AgentCopilot />);
+
+      await user.click(screen.getByRole("button", { name: "删除" }));
+      await user.click(screen.getByRole("button", { name: "取消" }));
+      expect(screen.queryByRole("group", { name: "删除这条消息？" })).not.toBeInTheDocument();
+      // 退出确认后焦点交还删除按钮，键盘用户不会掉到 body
+      expect(screen.getByRole("button", { name: "删除" })).toHaveFocus();
+
+      await user.click(screen.getByRole("button", { name: "删除" }));
+      await user.keyboard("{Escape}");
+      expect(screen.queryByRole("group", { name: "删除这条消息？" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "删除" })).toHaveFocus();
+
+      // Tab 离开确认区域：确认态结束，焦点留在用户去的地方
+      await user.click(screen.getByRole("button", { name: "删除" }));
+      await user.tab();
+      expect(screen.queryByRole("group", { name: "删除这条消息？" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "删除" })).not.toHaveFocus();
+
+      // 点区域内的提示文字不算离开；点区域外不可聚焦的消息文字算离开
+      await user.click(screen.getByRole("button", { name: "删除" }));
+      await user.click(screen.getByText("删除这条消息？"));
+      expect(screen.getByRole("group", { name: "删除这条消息？" })).toBeInTheDocument();
+      await user.click(screen.getByText("第 3 镜改成黄昏"));
+      expect(screen.queryByRole("group", { name: "删除这条消息？" })).not.toBeInTheDocument();
+      expect(withdrawQueuedMessage).not.toHaveBeenCalled();
+    });
+
+    it("stays in the delete confirmation with focus on cancel when the deletion leaves the message in place", async () => {
+      const user = userEvent.setup();
+      useAssistantStore.setState({
+        currentSessionId: "session-1",
+        sessionStatus: "running",
+        queuedMessages: [{ id: "q-1", content: [{ type: "text", text: "第 3 镜改成黄昏" }], state: "queued" }],
+      });
+      render(<AgentCopilot />);
+
+      await user.click(screen.getByRole("button", { name: "删除" }));
+      await user.click(screen.getByRole("button", { name: "确认删除" }));
+
+      expect(withdrawQueuedMessage).toHaveBeenCalledWith("q-1", "delete");
+      // 撤回没能移出消息时这一行还在：确认态不退出，焦点回到取消，可以重试或取消
+      const confirm = screen.getByRole("group", { name: "删除这条消息？" });
+      await waitFor(() => expect(within(confirm).getByRole("button", { name: "取消" })).toHaveFocus());
+      expect(within(confirm).getByRole("button", { name: "确认删除" })).toBeEnabled();
     });
 
     it("explains unsent messages and offers send, edit and delete on each of them", async () => {
@@ -509,6 +569,7 @@ describe("AgentCopilot", () => {
       await user.click(within(unsent).getByRole("button", { name: "编辑" }));
       expect(withdrawQueuedMessage).toHaveBeenCalledWith("q-1", "edit");
       await user.click(within(unsent).getByRole("button", { name: "删除" }));
+      await user.click(within(unsent).getByRole("button", { name: "确认删除" }));
       expect(withdrawQueuedMessage).toHaveBeenCalledWith("q-1", "delete");
       expect(screen.getByRole("combobox", { name: "Agent 输入" })).toHaveValue("");
     });
@@ -556,10 +617,11 @@ describe("AgentCopilot", () => {
       expect(within(tray).getByText("第 3 镜改成黄昏")).toBeVisible();
       expect(within(tray).queryByRole("button", { name: "立即发送" })).not.toBeInTheDocument();
 
-      await user.click(within(tray).getByRole("button", { name: "删除" }));
-      expect(withdrawQueuedMessage).toHaveBeenCalledWith("q-1", "delete");
       await user.click(within(tray).getByRole("button", { name: "编辑" }));
       expect(withdrawQueuedMessage).toHaveBeenCalledWith("q-1", "edit");
+      await user.click(within(tray).getByRole("button", { name: "删除" }));
+      await user.click(within(tray).getByRole("button", { name: "确认删除" }));
+      expect(withdrawQueuedMessage).toHaveBeenCalledWith("q-1", "delete");
     });
 
     it("scrolls a long queue inside the tray and follows the newest message, leaving the input and stop button in place", () => {
@@ -608,6 +670,14 @@ describe("AgentCopilot", () => {
       expect(tray.scrollTop).toBe(0);
       act(() => useAssistantStore.setState((s) => ({ queuedMessages: [...s.queuedMessages, queued(21)] })));
       expect(tray.scrollTop).toBe(640);
+
+      // 立即发送把末尾那条排到最前：快照重排不是追加，滚到顶部露出它
+      act(() =>
+        useAssistantStore.setState((s) => ({
+          queuedMessages: [s.queuedMessages[s.queuedMessages.length - 1]!, ...s.queuedMessages.slice(0, -1)],
+        })),
+      );
+      expect(tray.scrollTop).toBe(0);
     });
   });
 

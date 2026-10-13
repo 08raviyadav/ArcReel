@@ -400,6 +400,20 @@ class ManagedSession:
         self.queued_messages.remove(queued)
         self.channel.broadcast({"type": "queued_message", "op": "remove", "id": queued.id, **broadcast_fields})
 
+    def move_queued_message_first(self, queued: QueuedMessage) -> None:
+        """把一条排队消息移到最前并重播整份快照：立即发送后托盘顺序跟随 CLI 的处理顺序。已不在列表中时什么也不做。"""
+        if queued not in self.queued_messages or self.queued_messages[0] is queued:
+            return
+        self.queued_messages.remove(queued)
+        self.queued_messages.insert(0, queued)
+        self.channel.broadcast(
+            {
+                "type": "queued_message",
+                "op": "reorder",
+                "messages": [item.to_payload() for item in self.queued_messages],
+            }
+        )
+
     def discard_queued_message(self, queued: QueuedMessage, **broadcast_fields: Any) -> None:
         """排队消息未被接纳就离开：移出并释放幂等键，同键重试会重新送入。"""
         self.remove_queued_message(queued, **broadcast_fields)
@@ -1382,6 +1396,12 @@ class SessionManager:
         delivering = False
         try:
             await self.meta_store.update_status(session_id, "running")
+            live = self.sessions.get(session_id)
+            if live is not managed:
+                # 落库期间会话已被驱逐完：这次 running 落在驱逐写的终态之后，按当前真相补写——同一 id 已有
+                # 新会话就写新会话的状态，否则写回驱逐的终态；之后按失败收尾
+                await self.meta_store.update_status(session_id, managed.status if live is None else live.status)
+                raise RuntimeError("session evicted while the message was being delivered")
             delivering = True
             await managed.send_query(
                 _user_message_frame(queued.content, cli_uuid, priority=priority), sdk_session_id=session_id
@@ -1394,6 +1414,9 @@ class SessionManager:
                 # 写入 CLI 失败说明管道已断，actor 随之退出，由 send_query 与 actor 退出路径落 error
                 if not delivering:
                     managed.abandon_running(epoch)
+                raise
+            if session_id in self._disconnecting or self.sessions.get(session_id) is not managed:
+                # 会话正在被驱逐，或等 meta 写库期间已被驱逐完：终态由驱逐收尾写入，这里不抢写 error
                 raise
             managed.status = "error"
             try:
@@ -1597,6 +1620,8 @@ class SessionManager:
             # 确定送入才登记：等锁期间它可能已离开排队，登记残留会让之后的 aborted_* 轮次都被当成插队打断
             if priority == "now":
                 managed.now_messages_in_flight.add(queued.cli_uuid)
+                # CLI 先处理它：托盘也把它排到最前
+                managed.move_queued_message_first(queued)
             await self._deliver_queued_message(managed, queued, on_failure=_not_delivered, priority=priority)
 
     async def resend_queued_message(
