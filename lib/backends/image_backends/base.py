@@ -14,7 +14,7 @@ from lib.backends.artifact_download_guard import IMAGE_ARTIFACT_MAX_BYTES, artif
 from lib.backends.backend_runtime import stream_to_file
 from lib.backends.data_uri import image_to_data_uri as _image_to_data_uri
 from lib.billing.metering import Usage
-from lib.infra.async_thread import run_sync_transaction
+from lib.infra.async_thread import run_noninterruptible_sync
 
 
 def image_to_base64_data_uri(image_path: Path) -> str:
@@ -32,6 +32,10 @@ async def save_image_from_response_item(item, output_path: Path) -> None:
     """从 OpenAI 兼容 SDK 的 ``response.data[i]`` 提取图片并写入本地路径。
 
     优先 ``b64_json``；为空降级到 ``url`` 下载；两者皆空抛 ``ValueError``。
+    b64 解码写盘在供应商返回后的落账段内，走 ``run_noninterruptible_sync``：
+    取消不丢已计费产物，调用方照常继续后续步骤（见 ``docs/standards/backend.md``
+    「供应商返回之后的落账段不可中断」）。url 下载是异步流式取件，不属该段
+    线程调用的保护范围，取消照常传播。
     """
     b64 = getattr(item, "b64_json", None)
     if b64:
@@ -42,7 +46,7 @@ async def save_image_from_response_item(item, output_path: Path) -> None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(image_bytes)
 
-        await run_sync_transaction(_decode_and_save)
+        await run_noninterruptible_sync(_decode_and_save)
         return
     url = getattr(item, "url", None)
     if url:

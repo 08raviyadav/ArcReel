@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -873,3 +874,54 @@ class TestSubmittedBaseUrlReplay:
 
         assert result.task_id == "vid-a"
         assert (tmp_path / "out.mp4").read_bytes() == b"resumed"
+
+
+class _GatedWritePath(Path):
+    """写入被闸门挡住的 ``output_path``：观测取消与线程写入的交错，不 patch 生产符号。"""
+
+    def attach(self, started: threading.Event, release: threading.Event) -> _GatedWritePath:
+        self._started = started
+        self._release = release
+        return self
+
+    def write_bytes(self, data) -> int:
+        self._started.set()
+        self._release.wait(5)
+        return super().write_bytes(data)
+
+
+class TestDownloadWriteCancellation:
+    async def test_cancel_during_write_still_returns_result(self, tmp_path: Path):
+        """落账段不可中断：已下载的计费视频落盘时被取消挡住，照常完成 faststart 与结果返回。
+
+        faststart 在此打桩：本用例只判写盘一步的取消语义，faststart 本身是落盘后的
+        异步步骤，仍按规则的异步写入口径处理。
+        """
+        with captured_openai_clients():
+            from lib.backends.video_backends.openai import OpenAIVideoBackend
+
+            backend = OpenAIVideoBackend(api_key="<redacted>", model="sora-2")
+
+        client = AsyncMock()
+        client.videos.download_content = AsyncMock(return_value=_make_mock_content(b"fake-video-data"))
+        started = threading.Event()
+        release = threading.Event()
+        output = _GatedWritePath(tmp_path / "out.mp4").attach(started, release)
+        request = VideoGenerationRequest(prompt="Animate this", output_path=output, duration_seconds=4)
+
+        with patch(
+            "lib.backends.video_backends.openai.faststart_video_artifact",
+            new=AsyncMock(),
+        ):
+            task = asyncio.create_task(
+                backend._download_and_build_result(client, _make_mock_video(), request, {"seconds": "8"})
+            )
+            assert await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            await asyncio.to_thread(lambda: None)
+            assert not task.done()
+            release.set()
+            result = await task
+
+        assert result.video_path == output
+        assert output.read_bytes() == b"fake-video-data"

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -307,3 +309,37 @@ class TestDeclarativeImageBackend:
                 )
 
         assert caught.value.code == "declarative_image_save_failed"
+
+
+class _GatedWritePath(Path):
+    """写入被闸门挡住的 ``output_path``：观测取消与线程写入的交错，不 patch 生产符号。"""
+
+    def attach(self, started: threading.Event, release: threading.Event) -> _GatedWritePath:
+        self._started = started
+        self._release = release
+        return self
+
+    def write_bytes(self, data) -> int:
+        self._started.set()
+        self._release.wait(5)
+        return super().write_bytes(data)
+
+
+class TestInlineImageWriteCancellation:
+    async def test_cancel_during_inline_write_still_completes(self, tmp_path: Path):
+        """落账段不可中断：取件成功后的内联图片落盘被取消挡住，照常完成，不抛 CancelledError。"""
+        from lib.custom_provider.declarative_image_backend import _write_inline_image
+
+        started = threading.Event()
+        release = threading.Event()
+        output = _GatedWritePath(tmp_path / "out.png").attach(started, release)
+        state = SimpleNamespace(image_b64=PNG_B64)
+
+        task = asyncio.create_task(_write_inline_image(state, output))
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.to_thread(lambda: None)
+        assert not task.done()
+        release.set()
+        await task
+        assert output.read_bytes() == PNG_BYTES

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -400,3 +401,37 @@ class TestPricing:
         )
         assert amount == pytest.approx(0.010)
         assert currency == "USD"
+
+
+class _GatedWritePath(Path):
+    """写入被闸门挡住的 ``output_path``：观测取消与线程写入的交错，不 patch 生产符号。"""
+
+    def attach(self, started: threading.Event, release: threading.Event) -> _GatedWritePath:
+        self._started = started
+        self._release = release
+        return self
+
+    def write_bytes(self, data) -> int:
+        self._started.set()
+        self._release.wait(5)
+        return super().write_bytes(data)
+
+
+class TestBase64WriteCancellation:
+    async def test_cancel_during_b64_write_still_completes(self, tmp_path: Path):
+        """落账段不可中断：与公共落盘助手同款的 b64 解码写盘，取消不得丢已计费产物。"""
+        from lib.backends.image_backends.agnes import _write_base64_image
+
+        raw = b"\x89PNG\r\n\x1a\nfake-image"
+        started = threading.Event()
+        release = threading.Event()
+        output = _GatedWritePath(tmp_path / "out.png").attach(started, release)
+
+        task = asyncio.create_task(_write_base64_image(base64.b64encode(raw).decode("ascii"), output))
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.to_thread(lambda: None)
+        assert not task.done()
+        release.set()
+        await task
+        assert output.read_bytes() == raw

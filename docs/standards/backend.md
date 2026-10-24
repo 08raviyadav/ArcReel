@@ -36,7 +36,7 @@ paths:
 
 ### 供应商返回之后的落账段不可中断
 
-`GLOSSARY.md` 「取消」要求已发出的供应商调用照常跑完、结果照常成为产物。落到代码上：从供应商返回或产物提交起，到执行器返回前，这一段里的每个线程调用用 `lib/infra/async_thread.py` 的 `run_noninterruptible_sync`，它等线程结束后把结果交回调用方，本次取消随之消失。两种已出现过的事故形态：参考图压缩副本的清理与线程并发，把刚付费拿到的图片一起删掉；完成回调与失败补偿同时执行。
+`GLOSSARY.md` 「取消」要求已发出的供应商调用照常跑完、结果照常成为产物。落到代码上：从供应商返回或产物提交起，到执行器返回前，这一段里的每个线程调用用 `lib/infra/async_thread.py` 的 `run_noninterruptible_sync`，它等线程结束后把结果交回调用方，本次取消随之消失。公共落盘助手 `lib/backends/image_backends/base.py::save_image_from_response_item` 已满足本条，后端复用即可，无需各自绕开。两种已出现过的事故形态：参考图压缩副本的清理与线程并发，把刚付费拿到的图片一起删掉；完成回调与失败补偿同时执行。
 
 它吞掉取消，调用点放在 `asyncio.timeout` 块与 `asyncio.wait_for` 之外，否则超时失效。
 

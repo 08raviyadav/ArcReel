@@ -31,7 +31,7 @@ from lib.backends.transport_layer import TransportLayer
 from lib.billing.metering import Usage
 from lib.config.system_config import resolve_vertex_credentials_path
 from lib.config.url_utils import normalize_base_url
-from lib.infra.async_thread import run_sync_transaction
+from lib.infra.async_thread import run_noninterruptible_sync
 from lib.infra.logging_utils import format_kwargs_for_log
 
 logger = logging.getLogger(__name__)
@@ -176,8 +176,8 @@ class GeminiImageBackend:
             model=self._image_model, contents=contents, config=config
         )
 
-        # 5. 解析响应并保存
-        await run_sync_transaction(self._process_image_response, response, request.output_path)
+        # 5. 解析响应并保存：供应商已返回的落账段，不可中断，取消不丢已计费图片
+        await run_noninterruptible_sync(self._process_image_response, response, request.output_path)
 
         return ImageGenerationResult(
             image_path=request.output_path,

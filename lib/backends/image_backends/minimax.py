@@ -40,7 +40,7 @@ from lib.backends.minimax_shared import (
 from lib.backends.providers import PROVIDER_MINIMAX
 from lib.backends.transport_layer import TransportLayer
 from lib.billing.metering import Usage
-from lib.infra.async_thread import run_sync_transaction
+from lib.infra.async_thread import run_noninterruptible_sync
 from lib.infra.logging_utils import format_kwargs_for_log
 from lib.infra.retry import with_retry_async
 
@@ -259,6 +259,7 @@ async def _write_base64_image(b64: str, output_path: Path) -> None:
     """解码 base64 图片并写盘（解码 + 写盘 offload 到线程，避免事件循环内做 CPU 密集解码）。
 
     容忍少数中转返回 data URI（``data:image/...;base64,<payload>``）：剥前缀后再解码。
+    供应商返回后的落账段：用 ``run_noninterruptible_sync``，取消不丢已计费产物。
     """
     payload = b64
     if payload.startswith("data:") and "," in payload:
@@ -269,4 +270,4 @@ async def _write_base64_image(b64: str, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(image_bytes)
 
-    await run_sync_transaction(_decode_and_save)
+    await run_noninterruptible_sync(_decode_and_save)

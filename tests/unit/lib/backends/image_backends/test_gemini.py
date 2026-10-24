@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -225,3 +226,44 @@ class TestHelpers:
 
         loaded = GeminiImageBackend._load_image_detached(img_path)
         assert isinstance(loaded, PILImage.Image)
+
+
+class _GatedImage:
+    """``save`` 被闸门挡住的替身图片：观测取消与线程内保存的交错。"""
+
+    def __init__(self, started: threading.Event, release: threading.Event, data: bytes) -> None:
+        self._started = started
+        self._release = release
+        self._data = data
+
+    def save(self, path) -> None:
+        self._started.set()
+        self._release.wait(5)
+        Path(path).write_bytes(self._data)
+
+
+class TestSaveCancellation:
+    async def test_cancel_during_save_still_returns_result(self, backend_aistudio, fake_rate_limiter, tmp_path):
+        """落账段不可中断：供应商返回后的解析保存被取消挡住时，生成照常完成并返回结果。"""
+        output_file = tmp_path / "out.png"
+        started = threading.Event()
+        release = threading.Event()
+
+        mock_part = MagicMock()
+        mock_part.inline_data = b"fake"
+        mock_part.as_image.return_value = _GatedImage(started, release, b"\x89PNG\r\n\x1a\nfake-image")
+        mock_response = MagicMock()
+        mock_response.parts = [mock_part]
+        backend_aistudio._client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
+        task = asyncio.create_task(
+            backend_aistudio.generate(ImageGenerationRequest(prompt="a red ball", output_path=output_file))
+        )
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.to_thread(lambda: None)
+        assert not task.done()
+        release.set()
+        result = await task
+        assert result.image_path == output_file
+        assert output_file.read_bytes() == b"\x89PNG\r\n\x1a\nfake-image"
